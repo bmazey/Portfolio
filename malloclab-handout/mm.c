@@ -1,0 +1,442 @@
+/*
+ * We started with the implicit list implementation described in Chapter 9
+ * of the CS:APP book. We then implemented an explicit free list, using a
+ * custom mm_check() to ensure alignment properties of the blocks and list.
+ * 
+ * Free blocks are stored in a double linked list with next and previous 
+ * pointers to adjacent blocks. We restricted traversal operations on the
+ * linked list and allocated free lists using the first-fit technique. 
+ *
+ * We planned on implementing the segregated list from here, but time ran out
+ * during the busy finals season. If a large number of blocks are freed and
+ * then requested, this algorithm is relatively inefficient.
+ *
+ */
+
+
+#include <assert.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+ 
+#include "mm.h"
+#include "memlib.h"
+ 
+/*********************************************************
+ * NOTE TO STUDENTS: Before you do anything else, please
+ * replace the first three fields in the following struct
+ * with your own information (you may choose your own
+ * "team name").  Leave the last two feilds blank.
+ ********************************************************/
+
+team_t team = {
+        /* Team name */
+        "Concentration",
+        /* First member's full name */
+        "Brandon Mazey",
+        /* First member's NYU NetID*/
+        "bjm319@nyu.edu",
+        /* Second member's full name (leave blank if none) */
+        "Geoffrey Owen",
+        /* Second member's email address (leave blank if none) */
+        "gao237@nyu.edu"
+};
+ 
+ 
+/* Basic constants and macros */
+#define WORDSIZE 4       /* Word and header/footer size (bytes) */
+#define DWRDSIZE 8       /* Doubleword size (bytes) */
+ 
+#define MAX(x, y) ((x) > (y)? (x) : (y))  
+ 
+/* Pack a size and allocated bit into a word */
+#define PACK(size, alloc)  ((size) | (alloc))
+ 
+/* Read and write a word at address p */
+#define GET(p)       (*(unsigned int *)(p))          
+#define PUT(p, val)  (*(unsigned int *)(p) = (val))
+ 
+/* Read the size and allocated fields from address p */
+#define GET_SIZE(p)  (GET(p) & ~0x7)                  
+#define GET_ALLOC(p) (GET(p) & 0x1)            
+ 
+/* Given block ptr bp, compute address of its header and footer */
+#define HDRP(bp) (bp - WORDSIZE)
+#define FTRP(bp) (bp + GET_SIZE(HDRP(bp)))
+ 
+/* Given block ptr bp, compute address of next and previous blocks */
+#define NEXT_BLKP(bp) ((bp) + GET_SIZE(HDRP(bp)) + 2*WORDSIZE)
+#define PREV_BLKP(bp) (bp - GET_SIZE(bp-DWRDSIZE) - 2*WORDSIZE)
+ 
+#define GET_NEXT(bp)            (*(void **)(bp + DWRDSIZE))
+#define GET_PREV(bp)            (*(void **)bp)
+#define SET_NEXT(bp, ptr)       (GET_NEXT(bp) = ptr)
+#define SET_PREV(bp, ptr)       (GET_PREV(bp) = ptr)
+ 
+#define ALIGN(p) (((size_t)(p) + (7)) & ~(0x7))
+#define SIZE_T_SIZE (ALIGN(sizeof(size_t)))
+#define SIZE_PTR(p)  ((size_t*)(((char*)(p)) - SIZE_T_SIZE))
+ 
+/* Head of free list */
+void* FreeList = NULL;
+ 
+/* Prototypes for helper routines*/
+void mm_check(int verbose);
+static int in_heap(const void *p);
+static void coalesce(void *ptr);
+static void add(void *ptr);
+static void delete(void *ptr);
+static void *cleave(void *ptr, size_t newSize);
+ 
+/*
+ * Header blocks are aligned to 8 bytes.
+ * Return 0 if successful and -1 if something goes wrong.
+ *
+ */
+ 
+int mm_init(void) {
+
+        void * HeapBottom = mem_heap_lo();
+        FreeList = NULL;
+ 
+        if ((HeapBottom = mem_sbrk(2*WORDSIZE)) == (void *)-1) {
+                return -1;
+        }
+
+        PUT(HeapBottom, PACK(0,1));                             
+        PUT((char *)HeapBottom + WORDSIZE, PACK(0,1));
+       
+        return 0;
+
+}//end mm_init()
+ 
+/*
+ *
+ * Allocate an using an explicit free list with first-fit. We use cleave to ensure
+ * that the free block always comes before the allocated block. If no useable block
+ * is found, allocate a new block. Return NULL if we hit memory cap. 
+ *
+ */
+ 
+void *mm_malloc(size_t size) { 
+        
+	if (size <= 0) return NULL;
+      
+        void *list = FreeList;
+	unsigned int newSize;
+	unsigned int tempSize = 0;
+
+        int i = 0;
+       
+        // Modify size
+        if (size <= 4*DWRDSIZE) newSize = 4*DWRDSIZE;
+        
+	else newSize = ALIGN(size);
+             
+       
+        // Search for first-fit free block. Restrict number of operations.
+        while (list != NULL && i < 350) 
+	{
+
+                tempSize = GET_SIZE(HDRP(list));
+				
+                if (tempSize >= newSize) {
+                        
+		if (tempSize >= newSize + 32) return cleave(list, newSize);   
+						
+                        delete(list);
+
+                        PUT(HDRP(list), PACK(tempSize, 1));
+                        PUT(FTRP(list), PACK(tempSize, 1));
+                        return list;
+                } 
+				
+				else list = GET_NEXT(list); 
+				
+                i++;
+        }
+       
+        // Allocate additional memory in heap if no block is found within the ops restriction.
+        list = mem_sbrk(newSize + 2*WORDSIZE);
+       
+        // Return NULL if out of memory.
+        if ((long)list == -1) return NULL;
+
+        // Allocate memory and update epilogue.
+        PUT(HDRP(list), PACK(newSize, 1));
+        PUT(FTRP(list), PACK(newSize, 1));
+        PUT(FTRP(list) + WORDSIZE, PACK(0, 1));
+        return list;
+
+}//end mm_malloc()
+ 
+/*
+ * "Cleaves" blocks so we can minimize fragmentation.
+ * Ensures that we only allocate what is neccessary (minimum).
+ * Function requires pointer to present block and size needed.
+ * We then find a  new size for the block, places it on the heap, and return the pointer.
+ *
+ */
+
+static void* cleave(void *ptr, size_t newSize) {
+
+        int freeSize = GET_SIZE(HDRP(ptr)) - newSize - 2*WORDSIZE;
+ 
+        PUT(HDRP(ptr), PACK(freeSize, 0));
+        PUT(FTRP(ptr), PACK(freeSize, 0));
+
+        void *v = NEXT_BLKP(ptr);
+
+        PUT(HDRP(v), PACK(newSize, 1));
+        PUT(FTRP(v), PACK(newSize, 1));
+ 
+        return v;
+
+}//end cleave()
+ 
+/*     
+ * Coalesce minimizes internal fragmentation.
+ * There are only four possible cases to account for:
+ *
+ * 1. Both adjacent blocks are allocated. No coalescing needed; add pointer of current block.
+ *
+ * 2. Next block is free and previous block is allocated. We update the size of the current block, 
+ *    delete the pointer to the next block,and finally add the pointer of the resized block to the list.
+ *
+ * 3. Previous is free and next block is allocated. We then update the size of the previous block.
+
+ * 4. Both adjacent blocks are free. Update the size of the previous block and delete the pointer to the next block.
+ *
+ * That's it!
+ *
+ */
+
+static void coalesce(void *ptr) {
+
+        size_t nextAlloc = GET_ALLOC((char *)(FTRP(ptr)) + WORDSIZE);
+        size_t prevAlloc = GET_ALLOC((char *)(ptr) - DWRDSIZE);
+
+        size_t size = GET_SIZE(HDRP(ptr));
+ 
+        // First case
+        if (nextAlloc && prevAlloc) add(ptr);
+        
+        // Second case
+        else if (!nextAlloc && prevAlloc) 
+	{  
+                size += GET_SIZE(HDRP(NEXT_BLKP(ptr))) + 2*WORDSIZE;
+                delete(NEXT_BLKP(ptr));
+
+                PUT(HDRP(ptr), PACK(size, 0));
+                PUT(FTRP(ptr), PACK(size, 0));
+                add(ptr);
+        }
+		
+        // Third case
+        else if (nextAlloc && !prevAlloc) 
+	{
+                ptr = PREV_BLKP(ptr);
+                size += GET_SIZE(HDRP(ptr)) + 2*WORDSIZE;
+
+                PUT(HDRP(ptr), PACK(size, 0));
+                PUT(FTRP(ptr), PACK(size, 0));
+        }
+		
+        // Fourth case
+        else 
+	{
+                void * prev = PREV_BLKP(ptr);
+                void * next = NEXT_BLKP(ptr); 
+         
+                size += GET_SIZE(HDRP(prev)) + GET_SIZE(HDRP(next)) + 4*WORDSIZE;
+
+                PUT(HDRP(prev), PACK(size, 0));
+                PUT(FTRP(prev), PACK(size, 0));
+                delete(next);                          
+        }
+
+}//end coalesce()
+ 
+ 
+/*
+ * mm_free - add to free list. Make sure to coalesce if there are blocks in the free list.
+ * 
+ */
+ 
+void mm_free(void *ptr) {
+        
+        if(ptr == 0) return;
+		
+        size_t size = GET_SIZE(HDRP(ptr));
+       
+        PUT(HDRP(ptr), PACK(size, 0));
+        PUT(FTRP(ptr), PACK(size, 0));
+ 
+        if(FreeList != NULL) coalesce(ptr);
+        
+	else 
+	{
+            add(ptr);
+        }
+
+}// end mm_free()
+ 
+/* Add the block pointer to the free list to makie it the first item in the list */
+
+static void add(void *ptr) {
+        
+	void *top = FreeList;
+		
+        SET_NEXT(ptr, top);
+        SET_PREV(ptr, NULL);
+		
+        if (top != NULL) SET_PREV(top, ptr);
+		
+        FreeList = ptr;
+
+}// end add()
+ 
+/*
+ * Delete - removes a block pointer from the free list.
+ * If the pointer is at the front of the list, then update the front to be the next 
+ * block pointer.
+ *
+ */
+ 
+static void delete(void *ptr) {
+        
+	void *nextPtr = GET_NEXT(ptr);
+        void *prevPtr = GET_PREV(ptr);
+       
+        // Start with the front.
+        if (prevPtr == NULL) 
+	{
+                FreeList = nextPtr;
+				
+                if (nextPtr != NULL) 
+		{
+                        SET_PREV(nextPtr, NULL);
+                }
+        }
+		
+        else 
+	{
+                SET_NEXT(prevPtr, nextPtr);
+		if (nextPtr != NULL) SET_PREV(nextPtr, prevPtr);
+        }
+
+}//end delete()
+ 
+/*
+ * mm_realloc - using mm_malloc and mm_free.
+ *
+ */
+ 
+void *mm_realloc(void *ptr, size_t size) {
+
+    size_t oldSize;
+    void *newPtr;
+ 
+    if (size == 0) {
+       mm_free(ptr);
+       return 0;
+    }
+ 
+    // malloc if old pointer is NULL.
+    if (ptr == NULL) return mm_malloc(size);
+ 
+        newPtr = mm_malloc(size);
+ 
+    // Leave the original block alone if realloc fails.
+    if (!newPtr) return 0;
+ 
+    oldSize = GET_SIZE(HDRP(ptr));
+	
+    if (size < oldSize) oldSize = size;
+    memcpy(newPtr, ptr, oldSize);
+ 
+    mm_free(ptr);
+    // Don't forget to free!
+	
+    return newPtr;
+
+}//end mm_realloc()
+
+static int aligned(const void *p) {
+
+    return (size_t)ALIGN(p) == (size_t)p;
+
+}//end aligned()
+
+/*
+ * mm_check
+ *
+ * First make sure that the block is aligned and in the heap. Then make sure
+ * that the list is aligned too. Print out addresses of the present, next, and
+ * previous blocks. Also, print the total number of blocks and get the next block
+ * in the free list.
+ *
+ */
+ 
+void mm_check(int verbose) {
+
+        int i = 1;     
+        void *checkList = FreeList;
+       
+        printf("Now checking explicit list.\n");   
+		
+        if (!verbose) 
+	{
+                while (checkList != NULL) 
+		{
+                        checkList = GET_NEXT(checkList);
+                }
+				
+                printf("\nNo segmentation faults detected in explicit list.\n");
+				
+                return;
+        }
+		
+        else 
+	{
+                while (checkList != NULL) 
+		  {
+                        printf("block number: %d\n", i);
+
+			if (aligned(checkList)) printf("block: aligned\n");
+						
+                        else 
+			{
+                                printf("block: NOT aligned\n");
+                        }
+
+                       
+                        if (in_heap(checkList)) printf("Pointer found in the heap.\n");
+						
+                        else 
+			{
+                                printf("Pointer is not in the heap!\n");
+                                exit(0);
+                        }
+						
+                        printf("Pointer address: %p \n", checkList);
+                        printf("Previous pointer address: %p \n", GET_PREV(checkList));
+                        printf("Next pointer address: %p \n", GET_NEXT(checkList));
+                       
+                        checkList = GET_NEXT(checkList);
+                        i++;
+                }
+
+                printf("\nNumber of blocks with no seg faults: %d \n", i);
+        }
+}//end mm_check() REMOVE CALLS BEFORE SUBMISSION
+
+
+// this is an mm_check internal helper method used to ensure that a pointer is in the heap
+
+static int in_heap(const void *p) {
+
+        return p <= mem_heap_hi() && p >= mem_heap_lo();
+
+}//end in_heap()
